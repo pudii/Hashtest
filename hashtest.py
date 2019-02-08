@@ -105,7 +105,7 @@ class HashTest(taskmods.DllList, windowstations.WndScan):
         #get pfn data
         self.kernel_space = utils.load_as(self._config)
         kdbg = obj.Object("_KDDEBUGGER_DATA64",
-                          offset = obj.VolMagic(self.kernel_space).KDBG.v(),
+                          offset = obj.VolMagic(self.kernel_space).KDBG.v().v(),
                           vm = self.kernel_space)
         self.pfn_addr = kdbg.MmPfnDatabase.dereference_as("Pointer").v()
         
@@ -149,7 +149,7 @@ class HashTest(taskmods.DllList, windowstations.WndScan):
         outfd.write("Verifiable Allocs   - {0}\n".format(self.verifiable_allocs))
         outfd.write("\tExec Page Total   - {0}\n".format(self.page_exec))
         outfd.write("\tExec Non-Match    - {0}\n".format(self.page_non_match))
-        outfd.write("\tExec percentage   - {0:.2f}%\n".format((self.page_exec - self.page_non_match) / float(self.page_exec) * 100))
+        outfd.write("\tExec percentage   - {0:.2f}%\n".format((self.page_exec - self.page_non_match) / (float(self.page_exec) or 1) * 100))
         outfd.write("\tExec Data Page    - {0}\n".format(self.exec_data))
         outfd.write("Unverifiable Allocs - {0}\n".format(len(self.unverifiable_allocs)))
         outfd.write("Unknown Allocs      - {0}\n".format(self.unknown_allocs))
@@ -357,12 +357,16 @@ class HashTest(taskmods.DllList, windowstations.WndScan):
                     is_verifiable = False
                     # get hashes
                     file_hashes = self.hashes(index, filename)
+
                     # change name to description of contents
                     filename = special[start]
                     self.unverifiable_allocs.append(special[start])
                 else:
                     # get hashes for allocation that can be verfied
-                    file_hashes = self.hashes(index, filename)
+                    try:
+                        file_hashes = self.hashes(index, filename)
+                    except KeyError:
+                        pass
             else:
                 # unknown allocation
                 filename = ""
@@ -427,16 +431,17 @@ class HashTest(taskmods.DllList, windowstations.WndScan):
 
     def check_executable(self, ps_ad, vaddr):
         """Checks if the page which contains the virtual address is executable"""
-        pdpte = ps_ad.get_pdpte(vaddr)
-        pde = ps_ad.get_pde(vaddr, pdpte)
-        pte = ps_ad.get_pte(vaddr, pde)
+        pdpe = ps_ad.get_pdpi(vaddr)
+        pgd = ps_ad.get_pgd(vaddr, pdpe)
+        pte = ps_ad.get_pte(vaddr, pgd)
+
         # Check NX bit
         if pte & 1 << 63 == 1 << 63:
             # not executable
             return False        
         else:
             # check for transition
-            if pte & 1 << 11 == 1 << 11 and pte & 1 << 10 == 0:
+            if not (pte & 1) and pte & 1 << 11 == 1 << 11 and pte & 1 << 10 == 0:
                 # transition page, check pfn
                 return self.check_pfn(self.kernel_space, self.pfn_addr, pte >> 12)
             else:
@@ -522,5 +527,4 @@ class HashTest(taskmods.DllList, windowstations.WndScan):
             return True
         else:
             return False
-
 
