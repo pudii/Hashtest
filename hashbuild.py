@@ -431,7 +431,7 @@ class HashBuild:
                 offsets = " ".join(offsets)
             else:
                 offsets = ""
-            output.append(line.format(name, offset / 0x1000, hash, perms[offset / 0x1000], ""))
+            output.append(line.format(name, offset / 0x1000, hash, perms[offset / 0x1000], offsets))
             offset += 0x1000
         print "Hashed ", path
         return output
