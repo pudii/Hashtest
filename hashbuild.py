@@ -57,7 +57,7 @@ class Filesystem(Disk):
 
     def read(self, path):
         """Read all PE files on disk"""
-        f = open(path)
+        f = open(path, mode='rb')
         data = f.read()
         f.close()
         return data
@@ -90,15 +90,14 @@ class HashBuild:
         count = 0
         disk = Filesystem(diskfile)
         for name, path in disk.find():
-            if not(name in files):
-                files[name] = []
+            files.setdefault(name, [])
             files[name].append(path)
             count += 1
 
         # sort files (based on filename, not path)
         names = files.keys()
         names.sort()
-        
+         
         # output summary
         print "Found {0} files to hash".format(count) 
 
@@ -163,37 +162,53 @@ class HashBuild:
 
     def parse_header(self, physical):
         """Parse the header and return required values"""
-        # _IMAGE_DOS_HEADER
         if not(physical):
             return None
-        if physical[0:2] != "MZ":
-            print "Error, invalid dos header"
+
+        # _IMAGE_DOS_HEADER
+        dos_header = physical[0:0x40]
+        if dos_header[0:2] != "MZ":
+            print "Error, invalid DOS header"
             return None
-        e_lfanew = self.unpack(physical, 0x3C, 4)
-        # _IMAGE_NT_HEADERS
+
+        e_lfanew = self.unpack(dos_header, 0x3C, 4)
+
         if e_lfanew == 0 or e_lfanew > len(physical):
             print "MSDOS file"
             return None
-        if physical[e_lfanew:e_lfanew + 0x2] != "PE":
-            if physical[e_lfanew:e_lfanew + 0x2] == "NE":
+
+        # _IMAGE_NT_HEADERS - [ DWORD Signature , IMAGE_FILE_HEADER , IMAGE_OPTIONAL_HEADER32 ]
+        # The e_lfanew value is sometimes different, as it seems that one time it is interpreted as offset from 0 and other times as offset from 1. 
+        # Note: The first check is as for every PE file where the e_lfanew is unequal to 120, the PE\0\0 signature begins at e_lfanew-1. 
+        #       The second check is as for every PE file where e_lfanew is equal to 120, the PE\0\0 signature begins at e_lfanew.
+        if physical[e_lfanew-1:e_lfanew + 0x1] != "PE" and physical[e_lfanew:e_lfanew + 0x2] != "PE":
+            if physical[e_lfanew-1:e_lfanew + 0x1] == "NE":
                 print "NE file"
                 return None
             else:
                 print "Error, invalid nt header"
                 return None
-        nt_header = physical[e_lfanew:e_lfanew + 0xf8]
-        # _IMAGE_FILE_HEADER
-        file_header = nt_header[0x4:0x18]
+
+        if physical[e_lfanew-1:e_lfanew + 0x1] == "PE":
+	    nt_header_start = e_lfanew-1+4
+        if physical[e_lfanew:e_lfanew + 0x2] == "PE":
+	    nt_header_start = e_lfanew+4
+
+        # _IMAGE_FILE_HEADER (20 Bytes)
+        file_header = physical[nt_header_start:nt_header_start+0x18]
         num_sections = self.unpack(file_header, 0x2, 2)
-        optional_header_size = self.unpack(file_header, 0x10, 2)
+        size_optional_header = self.unpack(file_header, 0x10, 2)
+
         # _IMAGE_OPTIONAL_HEADER
-        if self.unpack(nt_header, 0x18, 2) != 0x010B:
-            print "Not a 32-bit PE - {0:x}".format(self.unpack(nt_header, 0x18, 4))
+        optional_header = physical[nt_header_start+0x14:nt_header_start+0x14+size_optional_header]
+        if self.unpack(optional_header, 0x0, 2) != 0x010B:
+            print "Not a 32-bit PE - {0:x}".format(self.unpack(optional_header, 0x0, 2))
             return None
-        header_size = self.unpack(nt_header, 0x18 + 0x3C, 4)
+        header_size = self.unpack(optional_header, 0x3c, 4)
         # return location of directories
         directories = e_lfanew + 0x78  # fixed value?
-        sections = e_lfanew + 0x18 + optional_header_size
+        sections = e_lfanew + 0x18 + size_optional_header
+
         return directories, sections, num_sections, header_size
 
     def parse_directories(self, physical, directories):
@@ -360,6 +375,7 @@ class HashBuild:
         vaddr = 0
         pages = {}
         unapplied = 0
+
         while vaddr < len(virtual):
             if vaddr in alterations:
                 zeroes = alterations[vaddr]
