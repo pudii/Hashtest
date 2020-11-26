@@ -214,7 +214,9 @@ class HashBuild:
     def parse_directories(self, physical, directories):
         """Parse the directories (_IMAGE_DATA_DIRECTORY) of interest
            (import / basereloc / IAT) for required information"""
+        # Base Relocation Table
         relocs = self.parse_directory(physical, directories + 0x28)
+        # Import Address Table
         iat = self.parse_directory(physical, directories + 0x60)
         return relocs, iat
 

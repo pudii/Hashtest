@@ -112,32 +112,32 @@ class HashBuild:
                     pe_file = pefile.PE(path, fast_load=True)
                     memory_lay = pe_file.get_memory_mapped_image()
 
-                    # dict_keys(['DOS_HEADER', 'NT_HEADERS', 'FILE_HEADER', 'Flags', 'OPTIONAL_HEADER', 'DllCharacteristics', 'PE Sections', 'Directories', 'Version Information', 'Exported symbols', 
-                    # 'Imported symbols', 'Resource directory', 'LOAD_CONFIG', 'Debug information', 'Base relocations'
-                    pe_file_dict = dict()
-
-                    pe_file.parse_data_directories(directories=[pefile.DIRECTORY_ENTRY['IMAGE_DIRECTORY_ENTRY_IMPORT'], pefile.DIRECTORY_ENTRY['IMAGE_DIRECTORY_ENTRY_IAT']], forwarded_exports_only=False, import_dllnames_only=False)
-                    # Dump imported symbols
-                    pe_file_dict['Imported symbols'] = self.dump_imports(pe_file)
-                    # Extract addresses where symbols are used
-                    imported_symbol_locations = self.get_imported_symbol_locations(pe_file_dict['Imported symbols'])
+                    if pe_file.PE_TYPE == pefile.OPTIONAL_HEADER_MAGIC_PE:
+                        addr_len = 4
+                    elif pe_file.PE_TYPE == pefile.OPTIONAL_HEADER_MAGIC_PE_PLUS:
+                        addr_len = 8
+                    else:
+                        print("Error: No PE or PE+ file.")
+                        break
+            
+                    iat_directory = pe_file.OPTIONAL_HEADER.DATA_DIRECTORY[pefile.DIRECTORY_ENTRY['IMAGE_DIRECTORY_ENTRY_IAT']]
+                    iat_zeroes = self.iat(iat_directory, addr_len)
                     
                     ################ BEGIN PARSING RELOCATIONS
                     ### ORIGINAL
-                    zeroes_in = self.orig_relocation_parsing(pe_file, memory_lay)
-                    to_zero_dict = self.build_to_zero_dict(imported_symbol_locations)
-                    to_zero_dict = to_zero_dict | zeroes_in # <-- Requires python 3.9. This is only quick test, might be modified.
+                    reloc_zeroes = self.orig_relocation_parsing(pe_file, memory_lay)
                     ################
                     ### PEFILE (is slower and consumes more memory)
-                    # abs_final = imported_symbol_locations
-                    # base_relocations_locations = self.pefile_relocation_parsing(pe_file)
-                    # abs_final = abs_final + base_relocations_locations
-                    # # Create page separated dictionary to zero out and hash per page
-                    # to_zero_dict = self.build_to_zero_dict(abs_final)
+                    #base_relocations_locations = self.pefile_relocation_parsing(pe_file)
+                    #reloc_zeroes = self.build_to_zero_dict(base_relocations_locations)      
                     ################ END PARSING RELOCATIONS
-     
-                    pages, zeroes = self.zero(memory_lay, to_zero_dict)             
 
+                    all_zeroes = reloc_zeroes | iat_zeroes
+                    intersec = set(iat_zeroes.keys()).intersection(set(reloc_zeroes.keys()))
+                    for page in intersec:
+                        all_zeroes[page] = sorted(reloc_zeroes[page] + iat_zeroes[page])    
+
+                    pages, zeroes = self.zero(memory_lay, all_zeroes)             
                     # hash
                     hashes = self.hash(pages)
 
@@ -177,44 +177,25 @@ class HashBuild:
             #output hashes for file
             self.write(hashfile, output)
 
+    def iat(self, iat_directory, addr_len):
+        """Determine where to normalise the import address table"""
+        iat_zeroes = {}
+        
+        offset = 0
+        
+        offset = iat_directory.VirtualAddress % 0x1000
+        addr = iat_directory.VirtualAddress - (offset)
+        iat_zeroes[addr] = []
+        while addr + offset < iat_directory.VirtualAddress + iat_directory.Size:
+            if offset == 0x1000:
+                # move to the next page
+                addr += offset
+                iat_zeroes[addr] = []
+                offset = 0
+            iat_zeroes[addr].append(offset)
+            offset += addr_len
 
-    def dump_imports(self, pe_file):
-        '''
-        Dump imports (from pefile package)
-        '''
-        imported_syms = list()
-        if hasattr(pe_file, 'DIRECTORY_ENTRY_IMPORT'):
-            for module in pe_file.DIRECTORY_ENTRY_IMPORT:
-                import_list = list()
-                imported_syms.append(import_list)
-                import_list.append(module.struct.dump_dict())
-                for symbol in module.imports:
-                    symbol_dict = dict()
-                    if symbol.import_by_ordinal is True:
-                        symbol_dict['DLL'] = module.dll
-                        symbol_dict['Ordinal'] = symbol.ordinal
-                    else:
-                        symbol_dict['DLL'] = module.dll
-                        symbol_dict['Name'] = symbol.name
-                        symbol_dict['Hint'] = symbol.hint
-
-                    import_list.append(symbol_dict)
-        return imported_syms
-
-    def get_imported_symbol_locations(self, imp_symbols):
-        '''
-        Extract addresses where symbols are used (from pefile package)
-        '''
-        imp_symbols_locations = list()
-        for j in range(0, len(imp_symbols)):
-            first = imp_symbols[j][0]['FirstThunk']['Value']
-            imp_symbols_locations.append(first)
-            for k in imp_symbols[j][1:]:
-                if 'Hint' in k:
-                    imp_symbols_locations.append(first+k['Hint'])
-                if 'Ordinal' in k:
-                    imp_symbols_locations.append(first+k['Ordinal'])
-        return imp_symbols_locations
+        return(iat_zeroes)
 
     def dump_relocations(self, pe_file):
         '''
@@ -298,7 +279,7 @@ class HashBuild:
         #### End orig relocation parsing
 
     def pefile_relocation_parsing(self, pe_file):
-        pe_file.parse_data_directories(directories=[pefile.DIRECTORY_ENTRY['IMAGE_DIRECTORY_ENTRY_BASERELOC']], forwarded_exports_only=True, import_dllnames_only=True)
+        pe_file.parse_data_directories(directories=[pefile.DIRECTORY_ENTRY['IMAGE_DIRECTORY_ENTRY_BASERELOC']])
         pe_file_dict = {}
         # Dump base relocations
         pe_file_dict['Base relocations'] = self.dump_relocations(pe_file)
@@ -380,6 +361,7 @@ class HashBuild:
                 offsets = " ".join(offsets)
             else:
                 offsets = ""
+                            #print([hex(x) for x in sorted(offsets[0x1ff*4096])])
 
             output.append(line.format(name, int(offset / 0x1000), hash, perms[int(offset / 0x1000)], offsets))
             offset += 0x1000
