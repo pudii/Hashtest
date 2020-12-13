@@ -27,8 +27,10 @@ import volatility.commands as commands
 import volatility.utils as utils
 import volatility.obj as obj
 import volatility.debug as debug
+import volatility.plugins.addrspaces as addrspaces
 import volatility.plugins.taskmods as taskmods
 import volatility.plugins.gui.windowstations as windowstations
+import volatility.plugins.overlays.windows as winoverlay
 
 # VAD permission flags
 PROTECT_FLAGS = [
@@ -172,7 +174,11 @@ class HashTest(taskmods.DllList, windowstations.WndScan):
         # TODO - add in checking for accesible pages outside VAD
         for vad in task.VadRoot.traverse():
             # save required information about each allocation
-            permissions = vad.u.VadFlags.Protection.v()
+            if isinstance(vad, winoverlay.vad_vtypes._MMVAD_WIN81):
+                permissions = vad.Core.u.VadFlags.Protection.v()
+            else:
+                permissions = vad.u.VadFlags.Protection.v()
+
             if "EXECUTE" in PROTECT_FLAGS[permissions]:
                 start = vad.Start
                 end = vad.End
@@ -218,8 +224,19 @@ class HashTest(taskmods.DllList, windowstations.WndScan):
         # TODO - find a better method of locating
         var = ps_ad.zread(0xbf9aa6dc, 4)
         section = struct.unpack("<L", var)[0]
-        section_object = obj.Object("_SECTION_OBJECT", offset=section, vm=ps_ad)
-        segment_addr = section_object.Segment.v()
+        #section_object = obj.Object("_SECTION", offset=section, vm=ps_ad)
+
+        if self.kernel_space.profile.metadata.get('major', 0) >= 6 and self.kernel_space.profile.metadata.get('minor', 0) >= 4:
+            # Windows 10
+            section_object = obj.Object("_SECTION", offset=section, vm=ps_ad)
+            segment_addr = section_object.u1.ControlArea.Segment.v()
+        else:
+            # not tested yet
+            section_object = obj.Object("_SECTION_OBJECT", offset=section, vm=ps_ad)
+            segment_addr = section_object.u1.ControlArea.v()
+
+        #segment_addr = section_object.u1.ControlArea.Segment.v()
+        #segment_addr = section_object.u1.ControlArea.v()
         return segment_addr
 
     def get_shared_heap(self, task):
@@ -232,9 +249,15 @@ class HashTest(taskmods.DllList, windowstations.WndScan):
         segments = {}
         for window_station in windowstations.WndScan.calculate(self):
             for desktop in window_station.desktops():
-                section_object = desktop.hsectionDesktop.dereference_as("_SECTION_OBJECT")
-                segment_addr = section_object.Segment.v()
-                segments[segment_addr] = "Desktop Heap - {0}\\{1}".format(desktop.WindowStation.Name, desktop.Name)
+                if self.kernel_space.profile.metadata.get('major', 0) >= 6 and self.kernel_space.profile.metadata.get('minor', 0) >= 4:
+                    section_object = desktop.hsectionDesktop.dereference_as("_SECTION")
+                    segment_addr = section_object.u1.ControlArea.Segment.v()
+                else:
+                    section_object = desktop.hsectionDesktop.dereference_as("_SECTION_OBJECT")
+                    segment_addr = section_object.Segment.v()
+
+                if section_object:
+                    segments[segment_addr] = "Desktop Heap - {0}\\{1}".format(desktop.WindowStation.Name, desktop.Name)
         return segments
 
     def get_winlogon_allocations(self, task, ps_ad):
@@ -431,7 +454,12 @@ class HashTest(taskmods.DllList, windowstations.WndScan):
 
     def check_executable(self, ps_ad, vaddr):
         """Checks if the page which contains the virtual address is executable"""
-        pdpe = ps_ad.get_pdpi(vaddr)
+        if isinstance(ps_ad, addrspaces.amd64.AMD64PagedMemory):
+            pml4e = ps_ad.get_pml4e(vaddr)
+            pdpe = ps_ad.get_pdpi(vaddr, pml4e)
+        elif isinstance(ps_ad, addrspaces.intel.IA32PagedMemory):
+            pdpe = ps_ad.get_pdpi(vaddr)
+
         pgd = ps_ad.get_pgd(vaddr, pdpe)
         pte = ps_ad.get_pte(vaddr, pgd)
 
@@ -489,6 +517,13 @@ class HashTest(taskmods.DllList, windowstations.WndScan):
                 start = position - len(line)
                 current_name = name
             line = f.readline()
+            if line == "":
+                position = f.tell()
+                # -1 on size to strip trailing \n
+                index[name] = [start, position - start - 1]
+                start = position - len(line)
+                current_name = name
+        
         return index
 
     def hashes(self, index, filename):
@@ -508,7 +543,7 @@ class HashTest(taskmods.DllList, windowstations.WndScan):
         hash = line.split(",")
         hash[1] = int(hash[1], 16)      # offset
         hash[3] = int(hash[3])          # permission
-        hash[4] = hash[4].split(" ")    # locations to normalise
+        hash[4] = hash[4].strip("\r").split(" ")    # locations to normalise
         if hash[4] == [""]:
             hash[4] = []
         else:

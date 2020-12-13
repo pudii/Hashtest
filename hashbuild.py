@@ -57,9 +57,13 @@ class Filesystem(Disk):
 
     def read(self, path):
         """Read all PE files on disk"""
-        f = open(path, mode='rb')
-        data = f.read()
-        f.close()
+        try:
+            f = open(path, mode='rb')
+            data = f.read()
+            f.close()
+        except:
+            data = []
+            pass
         return data
 
     def find(self):
@@ -79,7 +83,7 @@ class HashBuild:
     "Build a hash for each PE file on the disk"
     def __init__(self, args):
         if len(args) != 3:
-            print "Usage - hashtest.py <mounted disk> <output file>"
+            print "Usage - hashbuild.py <mounted disk> <output file>"
             quit()
         diskfile = args[1]
         hashfile = args[2]

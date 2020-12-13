@@ -1,4 +1,5 @@
 # Copyright (c) 2013 Andrew White <awhite.au@gmail.com>
+# Copyright (c) 2020 Patrick Reichenberger
 
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -29,6 +30,7 @@ import os
 import os.path
 
 import pefile
+import hexdump
 
 # --------------
 # Abstract Class
@@ -79,7 +81,7 @@ class HashBuild:
     "Build a hash for each PE file on the disk"
     def __init__(self, args):
         if len(args) != 3:
-            print("Usage - hashtest.py <mounted disk> <output file>")
+            print("Usage - py3-hashbuild.py <mounted disk> <output file>")
             quit()
         diskfile = args[1]
         hashfile = args[2]
@@ -107,6 +109,8 @@ class HashBuild:
             output = []
             for path in paths:
                 try:
+                    #if name != "win32u.dll":
+                    #    break
                     print(path)
 
                     pe_file = pefile.PE(path, fast_load=True)
@@ -132,20 +136,44 @@ class HashBuild:
                     #reloc_zeroes = self.build_to_zero_dict(base_relocations_locations)      
                     ################ END PARSING RELOCATIONS
 
-                    all_zeroes = reloc_zeroes | iat_zeroes
+                    #all_zeroes = reloc_zeroes | iat_zeroes # Requires Python 3.9 which is not supported on <= Win7
+                    all_zeroes = reloc_zeroes
                     intersec = set(iat_zeroes.keys()).intersection(set(reloc_zeroes.keys()))
                     for page in intersec:
                         all_zeroes[page] = sorted(reloc_zeroes[page] + iat_zeroes[page])    
+                    for page in set(iat_zeroes.keys())-intersec:
+                        all_zeroes[page] = iat_zeroes[page]
 
-                    pages, zeroes = self.zero(memory_lay, all_zeroes)             
+                    pages, zeroes = self.zero(memory_lay, all_zeroes, addr_len)             
                     # hash
                     hashes = self.hash(pages)
 
                 except pefile.PEFormatError as error:
                     print("PEFormatError in file \"{path}\": {error}".format(path=path, error=error))
+                    break
+                except FileNotFoundError as error:
+                    break
 
 
-                perms_list = [0]
+                perms_list = []
+                header_num_pages = 0
+                perms_list.extend([0]*(pe_file.OPTIONAL_HEADER.SizeOfHeaders // 4096))
+                header_num_pages += pe_file.OPTIONAL_HEADER.SizeOfHeaders // 4096
+
+                # Add page permission for partly used header page
+                if pe_file.OPTIONAL_HEADER.SizeOfHeaders % 4096 != 0:
+                    perms_list.append(0)
+                    header_num_pages += 1
+
+                # Adjust alignment for header
+                if pe_file.OPTIONAL_HEADER.SectionAlignment // 4096:
+                    header_align_pages = header_num_pages % (pe_file.OPTIONAL_HEADER.SectionAlignment // 4096)
+                else:
+                    header_alig_pages = 0
+                if header_align_pages != 0:
+                    perms_list.extend([0]*((pe_file.OPTIONAL_HEADER.SectionAlignment // 4096)-header_align_pages))
+                    header_num_pages += (pe_file.OPTIONAL_HEADER.SectionAlignment // 4096)-header_align_pages
+
                 for section in pe_file.sections:
                     if (section.Characteristics & 0x20000000) == 0x20000000:
                         perm_bit = 1
@@ -155,13 +183,17 @@ class HashBuild:
                     perms_list.extend([perm_bit]*(section.Misc_VirtualSize // 4096))
                     num_pages += (section.Misc_VirtualSize // 4096)
                     # Check if section aligns at page boundary or not. If not -> append additional page
-                    if section.Misc_VirtualSize % 4096 !=0:
+                    if section.Misc_VirtualSize % 4096 != 0:
                         perms_list.append(perm_bit)
                         num_pages += 1
                     # check alignment
-                    align_pages = num_pages % (pe_file.OPTIONAL_HEADER.SectionAlignment // 4096)
-                    perms_list.extend([perm_bit]*align_pages)
-                    num_pages += 1
+                    if pe_file.OPTIONAL_HEADER.SectionAlignment // 4096:
+                        align_pages = num_pages % (pe_file.OPTIONAL_HEADER.SectionAlignment // 4096)
+                    else:
+                        align_pages = 0
+                    if align_pages != 0:
+                        perms_list.extend([perm_bit]*((pe_file.OPTIONAL_HEADER.SectionAlignment // 4096)-align_pages))
+                        num_pages += ((pe_file.OPTIONAL_HEADER.SectionAlignment // 4096)-align_pages)
 
                 # generate output for file
                 output.append(self.output(hashes, zeroes, perms_list, path, name))
@@ -222,6 +254,8 @@ class HashBuild:
         for i in range(0,len(base_relocs)):
             for relo in base_relocs[i]:
                 if 'Type' in relo and relo['Type'] == "HIGHLOW":
+                    base_relocations_locations.append(relo['RVA'])
+                if 'Type' in relo and relo['Type'] == "DIR64":
                     base_relocations_locations.append(relo['RVA'])
         return base_relocations_locations
 
@@ -295,7 +329,7 @@ class HashBuild:
             to_zero_dict[addr_page_bound*4096].append(i % 4096)
         return to_zero_dict
 
-    def zero(self, virtual, alterations):
+    def zero(self, virtual, alterations, addr_len):
         """Normalise the alterations and split into page size chunks"""
         vaddr = 0
         pages = {}
@@ -310,7 +344,8 @@ class HashBuild:
                     data = b"\x00" * unapplied
                     offset = unapplied
                     # add position of where alteration would start
-                    alterations[vaddr].insert(0, -(4 - unapplied))
+                    #alterations[vaddr].insert(0, -(4 - unapplied))
+                    alterations[vaddr].insert(0, -(addr_len - unapplied))
                     unapplied = 0
                 else:
                     data = b""
@@ -321,15 +356,15 @@ class HashBuild:
                     # add previous
                     data += virtual[vaddr + offset:vaddr + zero]
                     # add zeroes
-                    if zero <= 0x1000 - 4:
+                    if zero <= 0x1000 - addr_len:
                         # does not cross page boundary
-                        data += b"\x00\x00\x00\x00"
-                        offset = zero + 4
+                        data += b"\x00"*addr_len
+                        offset = zero + addr_len
                     else:
                         # crosses page boundary
                         diff = 0x1000 - zero
                         data += b"\x00" * diff
-                        unapplied = 4 - diff
+                        unapplied = addr_len - diff
                         offset = 0x1000
                 # add remaining
                 if offset < 0x1000:
@@ -361,7 +396,6 @@ class HashBuild:
                 offsets = " ".join(offsets)
             else:
                 offsets = ""
-                            #print([hex(x) for x in sorted(offsets[0x1ff*4096])])
 
             output.append(line.format(name, int(offset / 0x1000), hash, perms[int(offset / 0x1000)], offsets))
             offset += 0x1000
